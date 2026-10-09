@@ -186,24 +186,27 @@ impl Aria2RpcClient {
         Ok(AddUriOutcome::Created(gid))
     }
 
-    /// 查找具有相同 URI 和存储路径的活跃任务
+    /// 查找具有相同 URI 和存储路径的活跃、等待或暂停任务。
+    ///
+    /// aria2 的 `tellWaiting` 同时返回等待队列中的任务和已暂停任务，
+    /// 因此这里不查询 `tellStopped`，避免把已完成、失败或已移除任务当作重复任务。
     // 输入：待比较的 URI 列表和可选下载配置。
-    // 功能：遍历活跃任务以查找重复下载。
-    // 错误：任务详情比较失败时返回 RpcError。
+    // 功能：遍历活跃、等待和暂停任务，以查找重复下载。
+    // 错误：任务列表或任务详情查询失败时返回对应的 Aria2Error。
     async fn find_existing_task(
         &self,
         uris: &[String],
         options: &Option<DownloadOptions>,
     ) -> Aria2Result<Option<String>> {
-        // 仅获取活跃任务，等待和已停止任务不参与重复检查。
-        let active_tasks = self.tell_active().await.unwrap_or_default();
+        // 先获取正在下载的任务，再获取等待队列中的任务；tellWaiting 也覆盖暂停任务。
+        let mut tasks = self.tell_active().await?;
+        tasks.extend(self.tell_waiting(0, u32::MAX).await?);
 
-        // 检查每个任务
-        for task in active_tasks {
-            if let Ok(status) = self.tell_status(&task.gid).await {
-                if self.is_same_task(&status, uris, options).await? {
-                    return Ok(Some(task.gid));
-                }
+        // 逐个查询任务详情，任何 RPC 错误都必须返回给调用方，不能静默跳过。
+        for task in tasks {
+            let status = self.tell_status(&task.gid).await?;
+            if self.is_same_task(&status, uris, options).await? {
+                return Ok(Some(task.gid));
             }
         }
 
@@ -214,7 +217,7 @@ impl Aria2RpcClient {
     /// 检查任务是否具有相同的URI和存储路径
     // 输入：现有任务状态、待下载 URI 列表和可选下载配置。
     // 功能：比较任务文件 URI 与目标目录，判断是否为相同任务。
-    // 错误：获取任务文件信息失败时被忽略，其他比较错误返回 RpcError。
+    // 错误：获取任务文件信息失败时返回对应的 Aria2Error。
     async fn is_same_task(
         &self,
         status: &DownloadStatus,
@@ -224,21 +227,20 @@ impl Aria2RpcClient {
         // 获取详细信息需要调用其他方法，这里简化比较
         // 实际实现中可能需要调用 aria2.getFiles 等方法获取完整信息
 
-        // 比较URI（简化版本，实际可能需要更复杂的逻辑）
-        if let Ok(files) = self.get_files(&status.gid).await {
-            for file in files {
-                for uri in uris {
-                    if file.uris.iter().any(|u| u.uri == *uri) {
-                        // 比较存储路径
-                        let target_dir = options.as_ref().and_then(|o| o.dir.as_ref());
-                        if let Some(dir) = target_dir {
-                            if file.path.starts_with(dir) {
-                                return Ok(true);
-                            }
-                        } else {
-                            // 如果没有指定目录，认为是相同的（使用默认目录）
+        // 获取任务文件信息；查询失败时直接返回，避免将 RPC 错误误判为不存在重复任务。
+        let files = self.get_files(&status.gid).await?;
+        for file in files {
+            for uri in uris {
+                if file.uris.iter().any(|u| u.uri == *uri) {
+                    // 比较存储路径
+                    let target_dir = options.as_ref().and_then(|o| o.dir.as_ref());
+                    if let Some(dir) = target_dir {
+                        if file.path.starts_with(dir) {
                             return Ok(true);
                         }
+                    } else {
+                        // 如果没有指定目录，认为是相同的（使用默认目录）
+                        return Ok(true);
                     }
                 }
             }
@@ -454,8 +456,8 @@ mod tests {
     /// A server that answers each request using `respond`, recording the bodies it received.
     ///
     /// `respond` is given the parsed request and the zero-based call index, so a test can answer differently to
-    /// the second call -- which is what the duplicate-detection path needs, since `add_uri` calls
-    /// `tellActive`, then `tellStatus` and `getFiles` per task.
+    /// each call. The duplicate-detection path calls `tellActive`, `tellWaiting`, then `tellStatus` and
+    /// `getFiles` for a matching task.
     async fn start_scripted_server<F>(
         calls: usize,
         respond: F,
@@ -571,6 +573,96 @@ mod tests {
             Err(Aria2Error::RpcError(message))
                 if message == "aria2.addUri 的 URI 列表不能为空"
         ));
+    }
+
+    /// 验证重复任务查询覆盖活跃任务、等待任务和暂停任务。
+    #[tokio::test]
+    async fn duplicate_lookup_includes_waiting_and_paused_tasks(
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let (port, seen) = start_scripted_server(4, |_index, request| {
+            let response = match request["method"].as_str() {
+                Some("aria2.tellActive") => {
+                    r#"{"jsonrpc":"2.0","id":"1","result":[]}"#
+                }
+                Some("aria2.tellWaiting") => {
+                    r#"{"jsonrpc":"2.0","id":"1","result":[{"gid":"paused-gid","status":"paused","totalLength":"1","completedLength":"0","downloadSpeed":"0"}]}"#
+                }
+                Some("aria2.tellStatus") => {
+                    r#"{"jsonrpc":"2.0","id":"1","result":{"gid":"paused-gid","status":"paused","totalLength":"1","completedLength":"0","downloadSpeed":"0"}}"#
+                }
+                Some("aria2.getFiles") => {
+                    r#"{"jsonrpc":"2.0","id":"1","result":[{"path":"/downloads/file.bin","uris":[{"uri":"https://example.com/file.bin","status":"used"}]}]}"#
+                }
+                _ => {
+                    r#"{"jsonrpc":"2.0","id":"1","error":{"code":-1,"message":"unexpected RPC method"}}"#
+                }
+            };
+            response.to_string()
+        })
+        .await?;
+
+        let client = Aria2RpcClient::new(port, None);
+        let result = client
+            .add_uri(vec!["https://example.com/file.bin".to_string()], None)
+            .await?;
+
+        assert_eq!(
+            result,
+            super::AddUriOutcome::Existing("paused-gid".to_string())
+        );
+
+        let requests = seen.lock().expect("请求记录未被污染").clone();
+        let methods: Vec<&str> = requests
+            .iter()
+            .map(|request| request["method"].as_str().expect("请求必须包含 method"))
+            .collect();
+        assert_eq!(
+            methods,
+            vec![
+                "aria2.tellActive",
+                "aria2.tellWaiting",
+                "aria2.tellStatus",
+                "aria2.getFiles"
+            ]
+        );
+
+        let waiting_params = requests[1]["params"]
+            .as_array()
+            .expect("tellWaiting 参数必须是数组");
+        assert_eq!(
+            waiting_params,
+            &[serde_json::json!(0), serde_json::json!(u32::MAX)]
+        );
+
+        Ok(())
+    }
+
+    /// 验证获取活跃任务失败时错误会向上传递，而不是继续创建任务。
+    #[tokio::test]
+    async fn duplicate_lookup_propagates_task_list_errors(
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let (port, seen) = start_scripted_server(1, |_index, _request| {
+            r#"{"jsonrpc":"2.0","id":"1","error":{"code":1,"message":"active query failed"}}"#
+                .to_string()
+        })
+        .await?;
+
+        let client = Aria2RpcClient::new(port, None);
+        let result = client
+            .add_uri(vec!["https://example.com/file.bin".to_string()], None)
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(Aria2Error::RpcError(message)) if message.contains("active query failed")
+        ));
+        assert_eq!(
+            seen.lock().expect("请求记录未被污染").len(),
+            1,
+            "查询失败后不得继续调用 aria2.addUri"
+        );
+
+        Ok(())
     }
 
     // ===================================================================================
